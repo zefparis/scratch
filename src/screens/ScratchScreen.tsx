@@ -1,5 +1,4 @@
 import { useEffect, useRef, useState, useCallback } from 'react';
-import type { PointerEvent as ReactPointerEvent } from 'react';
 import confetti from 'canvas-confetti';
 import Header from '../components/Header';
 import { api } from '../api';
@@ -24,11 +23,15 @@ const SYMBOL_VALUE_LABEL: Record<Sym, string> = {
   flame: '×2',
 };
 
-// Canvas geometry: 288×288 inner, 3×3 of 90×90 cells with 9px gaps.
+// Geometry: 288×288 inner, 3×3 of 90×90 cells with 9px gaps.
 const CANVAS = 288;
 const CELL = 90;
 const GAP = 9;
 const PAD = (CANVAS - CELL * 3 - GAP * 2) / 2;
+
+// Scratch settings (per spec: 25px radius, 55% reveal threshold).
+const BRUSH = 25;
+const REVEAL_THRESHOLD = 0.55;
 
 const cellRect = (i: number) => {
   const col = i % 3;
@@ -49,15 +52,17 @@ export default function ScratchScreen() {
   const [busy, setBusy] = useState(false);
   const [result, setResult] = useState<{ win: number; bet: number } | null>(null);
 
-  const canvasRef = useRef<HTMLCanvasElement | null>(null);
+  // Two stacked canvases: bottom = symbols, top = gold scratch overlay.
+  const baseRef = useRef<HTMLCanvasElement | null>(null);
+  const scratchRef = useRef<HTMLCanvasElement | null>(null);
   const okapiImg = useRef<HTMLImageElement | null>(null);
+
   const drawingRef = useRef(false);
   const lastPos = useRef<{ x: number; y: number } | null>(null);
   const cellRevealedRef = useRef<boolean[]>(Array(9).fill(false));
   const cellStrokesRef = useRef<number[]>(Array(9).fill(0));
   const claimingRef = useRef(false);
 
-  // Refresh balance.
   const refreshBalance = useCallback(async () => {
     try {
       const me = await api.me();
@@ -74,13 +79,14 @@ export default function ScratchScreen() {
     img.src = '/images/okapi/okapi-tip.png';
   }, []);
 
-  // Paint the base layer (symbols) + the opaque scratch overlay on top.
-  const paintBaseAndOverlay = useCallback(() => {
-    const canvas = canvasRef.current;
+  // ----- BASE LAYER: 3×3 grid with symbols (drawn once per ticket) -----
+  const drawBase = useCallback(() => {
+    const canvas = baseRef.current;
     if (!canvas || !grid) return;
     const ctx = canvas.getContext('2d')!;
+    ctx.clearRect(0, 0, CANVAS, CANVAS);
 
-    // ----- base layer: symbols + value tags -----
+    // Card background (dark gold gradient + watermark)
     const bg = ctx.createLinearGradient(0, 0, CANVAS, CANVAS);
     bg.addColorStop(0, '#3a2a0a');
     bg.addColorStop(0.5, '#1a1308');
@@ -88,7 +94,6 @@ export default function ScratchScreen() {
     ctx.fillStyle = bg;
     ctx.fillRect(0, 0, CANVAS, CANVAS);
 
-    // Watermark "CG"
     ctx.save();
     ctx.globalAlpha = 0.08;
     ctx.fillStyle = '#f5c542';
@@ -130,36 +135,54 @@ export default function ScratchScreen() {
       ctx.font = 'bold 12px Arial';
       ctx.fillText(SYMBOL_VALUE_LABEL[sym], cx, cy + 28);
     }
+  }, [grid]);
 
-    // ----- scratch overlay on top -----
-    ctx.fillStyle = '#6b6256';
+  // ----- SCRATCH LAYER: opaque gold-grey surface user erases -----
+  const drawScratchLayer = useCallback(() => {
+    const canvas = scratchRef.current;
+    if (!canvas) return;
+    const ctx = canvas.getContext('2d')!;
+    ctx.globalCompositeOperation = 'source-over';
+    ctx.clearRect(0, 0, CANVAS, CANVAS);
+
+    // Gold-grey base
+    const grad = ctx.createLinearGradient(0, 0, CANVAS, CANVAS);
+    grad.addColorStop(0, '#8a7a55');
+    grad.addColorStop(0.5, '#6b6256');
+    grad.addColorStop(1, '#8a7a55');
+    ctx.fillStyle = grad;
     ctx.fillRect(0, 0, CANVAS, CANVAS);
+
+    // Sheen
     const sheen = ctx.createLinearGradient(0, 0, CANVAS, CANVAS);
-    sheen.addColorStop(0, 'rgba(255,255,255,0.15)');
+    sheen.addColorStop(0, 'rgba(255,255,255,0.2)');
     sheen.addColorStop(0.5, 'rgba(255,255,255,0.02)');
-    sheen.addColorStop(1, 'rgba(255,255,255,0.15)');
+    sheen.addColorStop(1, 'rgba(255,255,255,0.2)');
     ctx.fillStyle = sheen;
     ctx.fillRect(0, 0, CANVAS, CANVAS);
+
+    // Hint text
     ctx.fillStyle = 'rgba(245,197,66,0.85)';
-    ctx.font = 'bold 22px Arial';
     ctx.textAlign = 'center';
     ctx.textBaseline = 'middle';
+    ctx.font = 'bold 22px Arial';
     ctx.fillText('GRATTEZ', CANVAS / 2, CANVAS / 2 - 10);
     ctx.font = 'bold 12px Arial';
     ctx.fillStyle = 'rgba(245,197,66,0.65)';
     ctx.fillText('avec votre doigt', CANVAS / 2, CANVAS / 2 + 14);
-  }, [grid]);
+  }, []);
 
-  // Re-paint whenever grid changes (new ticket).
+  // (Re)init both layers when a new grid arrives.
   useEffect(() => {
     if (!grid) return;
     cellRevealedRef.current = Array(9).fill(false);
     cellStrokesRef.current = Array(9).fill(0);
     claimingRef.current = false;
-    paintBaseAndOverlay();
-  }, [grid, paintBaseAndOverlay]);
+    drawBase();
+    drawScratchLayer();
+  }, [grid, drawBase, drawScratchLayer]);
 
-  // Sample-based scratched % for a cell.
+  // Sample-based scratched % for a single cell on the SCRATCH canvas.
   const measureCell = (ctx: CanvasRenderingContext2D, i: number) => {
     const r = cellRect(i);
     const data = ctx.getImageData(r.x, r.y, r.w, r.h).data;
@@ -168,7 +191,7 @@ export default function ScratchScreen() {
     let total = 0;
     for (let py = 0; py < r.h; py += step) {
       for (let px = 0; px < r.w; px += step) {
-        const idx = (py * r.w + px) * 4 + 3;
+        const idx = (py * r.w + px) * 4 + 3; // alpha
         if (data[idx] < 32) cleared++;
         total++;
       }
@@ -176,13 +199,14 @@ export default function ScratchScreen() {
     return cleared / total;
   };
 
-  const checkAllRevealed = useCallback(async () => {
-    if (claimingRef.current) return;
+  // Auto-claim trigger.
+  const onAllRevealed = useCallback(async () => {
+    if (claimingRef.current || !ticketId) return;
     if (!cellRevealedRef.current.every(Boolean)) return;
-    if (!ticketId) return;
     claimingRef.current = true;
-    // Fully wipe overlay so user clearly sees the full grid.
-    const canvas = canvasRef.current;
+
+    // Fully wipe overlay for a clean reveal.
+    const canvas = scratchRef.current;
     if (canvas) {
       const ctx = canvas.getContext('2d')!;
       ctx.save();
@@ -206,19 +230,20 @@ export default function ScratchScreen() {
     }
   }, [ticketId, bet]);
 
-  // Safety auto-reveal after 20s if user stops scratching.
+  // Safety auto-reveal after 20s of inactivity.
   useEffect(() => {
     if (!ticketId) return;
     const t = setTimeout(() => {
       if (claimingRef.current) return;
       cellRevealedRef.current = Array(9).fill(true);
-      checkAllRevealed();
+      onAllRevealed();
     }, 20000);
     return () => clearTimeout(t);
-  }, [ticketId, checkAllRevealed]);
+  }, [ticketId, onAllRevealed]);
 
-  const scratchAt = (clientX: number, clientY: number) => {
-    const canvas = canvasRef.current;
+  // Erase a stroke at (clientX, clientY) on the SCRATCH canvas.
+  const scratchAt = useCallback((clientX: number, clientY: number) => {
+    const canvas = scratchRef.current;
     if (!canvas) return;
     const rect = canvas.getBoundingClientRect();
     const sx = canvas.width / rect.width;
@@ -229,7 +254,7 @@ export default function ScratchScreen() {
     const ctx = canvas.getContext('2d')!;
     ctx.save();
     ctx.globalCompositeOperation = 'destination-out';
-    ctx.lineWidth = 26;
+    ctx.lineWidth = BRUSH * 2;
     ctx.lineCap = 'round';
     ctx.lineJoin = 'round';
     if (lastPos.current) {
@@ -237,50 +262,92 @@ export default function ScratchScreen() {
       ctx.moveTo(lastPos.current.x, lastPos.current.y);
       ctx.lineTo(x, y);
       ctx.stroke();
-    } else {
-      ctx.beginPath();
-      ctx.arc(x, y, 13, 0, Math.PI * 2);
-      ctx.fill();
     }
+    ctx.beginPath();
+    ctx.arc(x, y, BRUSH, 0, Math.PI * 2);
+    ctx.fill();
     ctx.restore();
     lastPos.current = { x, y };
 
-    // Check cells under cursor.
+    // Check cells under the brush.
     for (let i = 0; i < 9; i++) {
       if (cellRevealedRef.current[i]) continue;
       const r = cellRect(i);
-      if (x < r.x - 8 || x > r.x + r.w + 8) continue;
-      if (y < r.y - 8 || y > r.y + r.h + 8) continue;
+      if (x < r.x - BRUSH || x > r.x + r.w + BRUSH) continue;
+      if (y < r.y - BRUSH || y > r.y + r.h + BRUSH) continue;
       cellStrokesRef.current[i]++;
-      if (cellStrokesRef.current[i] % 6 !== 0) continue;
+      if (cellStrokesRef.current[i] % 4 !== 0) continue;
       const pct = measureCell(ctx, i);
-      if (pct > 0.6) {
+      if (pct > REVEAL_THRESHOLD) {
         cellRevealedRef.current[i] = true;
-        // Clean wipe of the cell for a sharp reveal.
+        // Clean wipe of the cell rectangle.
         ctx.save();
         ctx.globalCompositeOperation = 'destination-out';
         ctx.fillRect(r.x, r.y, r.w, r.h);
         ctx.restore();
-        checkAllRevealed();
+        onAllRevealed();
       }
     }
-  };
+  }, [onAllRevealed]);
 
-  const onPointerDown = (e: ReactPointerEvent<HTMLCanvasElement>) => {
+  // Native touch + mouse listeners on the scratch canvas only.
+  // Touch listeners are attached with { passive: false } so we can
+  // preventDefault() and stop page scroll on mobile.
+  useEffect(() => {
+    const canvas = scratchRef.current;
+    if (!canvas) return;
     if (!grid || result) return;
-    drawingRef.current = true;
-    lastPos.current = null;
-    (e.target as HTMLCanvasElement).setPointerCapture(e.pointerId);
-    scratchAt(e.clientX, e.clientY);
-  };
-  const onPointerMove = (e: ReactPointerEvent<HTMLCanvasElement>) => {
-    if (!drawingRef.current) return;
-    scratchAt(e.clientX, e.clientY);
-  };
-  const onPointerUp = () => {
-    drawingRef.current = false;
-    lastPos.current = null;
-  };
+
+    const start = (x: number, y: number) => {
+      drawingRef.current = true;
+      lastPos.current = null;
+      scratchAt(x, y);
+    };
+    const move = (x: number, y: number) => {
+      if (!drawingRef.current) return;
+      scratchAt(x, y);
+    };
+    const end = () => {
+      drawingRef.current = false;
+      lastPos.current = null;
+    };
+
+    // Mouse
+    const onMouseDown = (e: MouseEvent) => { e.preventDefault(); start(e.clientX, e.clientY); };
+    const onMouseMove = (e: MouseEvent) => { if (drawingRef.current) move(e.clientX, e.clientY); };
+    const onMouseUp = () => end();
+
+    // Touch
+    const onTouchStart = (e: TouchEvent) => {
+      e.preventDefault();
+      const t = e.touches[0];
+      if (t) start(t.clientX, t.clientY);
+    };
+    const onTouchMove = (e: TouchEvent) => {
+      e.preventDefault();
+      const t = e.touches[0];
+      if (t) move(t.clientX, t.clientY);
+    };
+    const onTouchEnd = (e: TouchEvent) => { e.preventDefault(); end(); };
+
+    canvas.addEventListener('mousedown', onMouseDown);
+    window.addEventListener('mousemove', onMouseMove);
+    window.addEventListener('mouseup', onMouseUp);
+    canvas.addEventListener('touchstart', onTouchStart, { passive: false });
+    canvas.addEventListener('touchmove', onTouchMove, { passive: false });
+    canvas.addEventListener('touchend', onTouchEnd, { passive: false });
+    canvas.addEventListener('touchcancel', onTouchEnd, { passive: false });
+
+    return () => {
+      canvas.removeEventListener('mousedown', onMouseDown);
+      window.removeEventListener('mousemove', onMouseMove);
+      window.removeEventListener('mouseup', onMouseUp);
+      canvas.removeEventListener('touchstart', onTouchStart);
+      canvas.removeEventListener('touchmove', onTouchMove);
+      canvas.removeEventListener('touchend', onTouchEnd);
+      canvas.removeEventListener('touchcancel', onTouchEnd);
+    };
+  }, [grid, result, scratchAt]);
 
   const buy = async () => {
     if (busy) return;
@@ -330,14 +397,19 @@ export default function ScratchScreen() {
 
       <div className="scratch-wrap">
         <div className="scratch-canvas-frame">
+          {/* Bottom layer: symbols */}
           <canvas
-            ref={canvasRef}
+            ref={baseRef}
             width={CANVAS}
             height={CANVAS}
-            onPointerDown={onPointerDown}
-            onPointerMove={onPointerMove}
-            onPointerUp={onPointerUp}
-            onPointerCancel={onPointerUp}
+            className="scratch-base"
+          />
+          {/* Top layer: gold scratch surface (touch target) */}
+          <canvas
+            ref={scratchRef}
+            width={CANVAS}
+            height={CANVAS}
+            className="scratch-top"
             style={{ cursor: grid && !result ? 'crosshair' : 'default' }}
           />
         </div>

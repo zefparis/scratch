@@ -135,6 +135,22 @@ button { font-family: inherit; }
   border-radius: 12px;
   display: block;
   touch-action: none;
+  -webkit-user-select: none;
+  user-select: none;
+}
+/* Stacked canvases: base (symbols) below, scratch overlay above. */
+.scratch-canvas-frame .scratch-base {
+  position: absolute;
+  top: 6px;
+  left: 6px;
+  z-index: 1;
+  pointer-events: none;
+}
+.scratch-canvas-frame .scratch-top {
+  position: absolute;
+  top: 6px;
+  left: 6px;
+  z-index: 2;
 }
 
 .cards {
