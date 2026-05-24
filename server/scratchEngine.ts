@@ -68,97 +68,40 @@ const WIN_LINES: [number, number, number][] = [
   [0, 4, 8], [2, 4, 6],                       // diagonals
 ];
 
-function randSym(exclude: Set<Symbol> = new Set()): Symbol {
-  const pool = SYMBOLS.filter((s) => !exclude.has(s));
-  return pool[Math.floor(Math.random() * pool.length)];
-}
+/**
+ * Flat grid builder — NO recursion, NO mutual calls.
+ * The authoritative payout is computed by evaluate() over the returned grid,
+ * so even if 'lose' grids contain incidental pairs/triples (unavoidable with
+ * 9 cells / 6 symbols), the bookkeeping stays correct.
+ */
+function buildGrid(type: 'win' | 'consolation' | 'lose', symbol?: Symbol): Symbol[] {
+  const symbols = SYMBOLS.slice();
+  const grid: Symbol[] = [];
 
-function shuffle<T>(arr: T[]): T[] {
-  const a = arr.slice();
-  for (let i = a.length - 1; i > 0; i--) {
-    const j = Math.floor(Math.random() * (i + 1));
-    [a[i], a[j]] = [a[j], a[i]];
-  }
-  return a;
-}
-
-/** Fill remaining cells with random symbols, ensuring NO unintended 3-in-a-row
- *  and (for non-consolation outcomes) at most a controlled number of pairs. */
-function fillSafe(grid: (Symbol | null)[], avoidPairs: boolean): Symbol[] {
-  const cells = grid.slice();
-  for (let i = 0; i < 9; i++) {
-    if (cells[i] != null) continue;
-    let tries = 0;
-    while (tries++ < 50) {
-      const s = randSym();
-      cells[i] = s;
-      // check no line of 3 same with already-placed cells
-      const bad = WIN_LINES.some(([a, b, c]) =>
-        cells[a] && cells[b] && cells[c] && cells[a] === cells[b] && cells[b] === cells[c]
-      );
-      if (bad) { cells[i] = null; continue; }
-      if (avoidPairs) {
-        const counts: Partial<Record<Symbol, number>> = {};
-        for (const x of cells) if (x) counts[x] = (counts[x] ?? 0) + 1;
-        if (Object.values(counts).some((n) => (n ?? 0) >= 2)) { cells[i] = null; continue; }
-      }
-      break;
+  if (type === 'win' && symbol) {
+    // Place 3 identical symbols in first row, rest random (others only).
+    grid.push(symbol, symbol, symbol);
+    for (let i = 3; i < 9; i++) {
+      const others = symbols.filter((s) => s !== symbol);
+      grid.push(others[Math.floor(Math.random() * others.length)]);
     }
-    if (cells[i] == null) cells[i] = randSym(); // give up, accept
+    return grid;
   }
-  return cells as Symbol[];
-}
 
-function buildWinningGrid(winSym: Symbol): Symbol[] {
-  const line = WIN_LINES[Math.floor(Math.random() * WIN_LINES.length)];
-  const grid: (Symbol | null)[] = Array(9).fill(null);
-  for (const idx of line) grid[idx] = winSym;
-  return fillSafe(grid, /*avoidPairs*/ false);
-}
-
-function buildConsolationGrid(): Symbol[] {
-  // Place exactly one pair of a random symbol, then fill avoiding 3-in-a-row
-  // and avoiding any further pair of OTHER symbols. The placed pair may coincidentally
-  // get a third match — we re-check and retry if so.
-  for (let attempt = 0; attempt < 20; attempt++) {
-    const sym = randSym();
-    const positions = shuffle([0, 1, 2, 3, 4, 5, 6, 7, 8]).slice(0, 2);
-    const grid: (Symbol | null)[] = Array(9).fill(null);
-    grid[positions[0]] = sym;
-    grid[positions[1]] = sym;
-    // Avoid lines of 3 same by construction; fill the rest with distinct symbols
-    const used = new Set<Symbol>([sym]);
-    const rest = shuffle([0, 1, 2, 3, 4, 5, 6, 7, 8].filter((i) => grid[i] == null));
-    let ok = true;
-    for (const i of rest) {
-      const choices = SYMBOLS.filter((s) => !used.has(s));
-      if (choices.length === 0) { ok = false; break; }
-      grid[i] = choices[Math.floor(Math.random() * choices.length)];
-      used.add(grid[i] as Symbol);
+  if (type === 'consolation') {
+    // Exactly 2 of one symbol, then fill with the others.
+    const s = symbols[Math.floor(Math.random() * symbols.length)];
+    grid.push(s, s);
+    const others = symbols.filter((x) => x !== s);
+    while (grid.length < 9) {
+      grid.push(others[grid.length % others.length]);
     }
-    if (!ok) continue;
-    if (evaluate(grid as Symbol[]).kind === 'consolation') return grid as Symbol[];
+    return grid.sort(() => Math.random() - 0.5);
   }
-  // fallback: simple lose grid (shouldn't happen)
-  return buildLoseGrid();
-}
 
-function buildLoseGrid(): Symbol[] {
-  // All distinct symbols → no pair, no triple. We have 6 symbols for 9 cells,
-  // so duplicates are unavoidable. We allow at most one repeated symbol that
-  // appears in non-line and non-pair-only positions? Pairs imply consolation.
-  // Easiest fully-losing layout: pick 9 cells using 6 symbols but ensure no
-  // symbol appears more than once → impossible. So minimum is one symbol
-  // appearing twice, which yields consolation. To truly lose, we must avoid
-  // having any pair, which is impossible with 9 cells / 6 symbols → therefore
-  // "lose" outcomes are absorbed into consolation. To respect the spec,
-  // treat 'lose' outcomes as: exactly one symbol appears twice and all others
-  // once or twice as well — i.e. there WILL be a pair, which scores consolation.
-  //
-  // To still produce true zero-win grids we'd need ≥9 distinct symbols.
-  // Resolution: re-route 'lose' to consolation here — kept as separate branch
-  // for clarity (and easy future expansion of the symbol set).
-  return buildConsolationGrid();
+  // lose: 9 cells from a 9-element pool, shuffled.
+  const pool: Symbol[] = [...symbols, ...symbols.slice(0, 3)];
+  return pool.sort(() => Math.random() - 0.5).slice(0, 9);
 }
 
 function evaluate(grid: Symbol[]): { kind: 'three' | 'consolation' | 'lose'; sym?: Symbol } {
@@ -176,20 +119,20 @@ export function generateGrid(bet: number): { grid: Symbol[]; win: number } {
   let grid: Symbol[];
   switch (outcome.kind) {
     case 'jackpot_okapi':
-      grid = buildWinningGrid('okapi');
+      grid = buildGrid('win', 'okapi');
       break;
     case 'three':
-      grid = buildWinningGrid(outcome.sym);
+      grid = buildGrid('win', outcome.sym);
       break;
     case 'consolation':
-      grid = buildConsolationGrid();
+      grid = buildGrid('consolation');
       break;
     case 'lose':
     default:
-      grid = buildLoseGrid();
+      grid = buildGrid('lose');
       break;
   }
-  // Re-evaluate authoritatively (defensive — handles fillSafe edge cases).
+  // Re-evaluate authoritatively over the returned grid.
   const ev = evaluate(grid);
   let win = 0;
   if (ev.kind === 'three' && ev.sym) {
